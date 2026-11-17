@@ -1,0 +1,11 @@
+[package]
+name = "transaction-processor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.6.8"
+csv = "1.4.0"
+rust_decimal = "1.43.0"
+serde = "1.0.229"
+thiserror = "2.0.21"
