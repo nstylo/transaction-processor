@@ -36,8 +36,6 @@ enum DisputeState {
 
 #[derive(Debug)]
 struct TransactionState {
-    // NOTE: the exercise does not specify the case in which a withdraw transaction
-    // is disputed. We will ha
     kind: TransactionKind,
     client: ClientId,
     amount: Decimal,
@@ -95,10 +93,19 @@ impl AccountState {
         }
 
         // validate and mutate after
-        match dispute.kind {
-            DisputeKind::Open => self._dispute(tx.amount),
-            DisputeKind::Resolve => self._resolve(tx.amount),
-            DisputeKind::ChargeBack => self._charge_back(tx.amount),
+        match (&tx.kind, &dispute.kind) {
+            (TransactionKind::Deposit, DisputeKind::Open) => self._dispute_deposit(tx.amount),
+            (TransactionKind::Deposit, DisputeKind::Resolve) => self._resolve_deposit(tx.amount),
+            (TransactionKind::Deposit, DisputeKind::ChargeBack) => {
+                self._charge_back_deposit(tx.amount)
+            }
+            (TransactionKind::Withdrawal, DisputeKind::Open) => self._dispute_withdrawal(tx.amount),
+            (TransactionKind::Withdrawal, DisputeKind::Resolve) => {
+                self._resolve_withdrawal(tx.amount)
+            }
+            (TransactionKind::Withdrawal, DisputeKind::ChargeBack) => {
+                self._charge_back_withdrawal(tx.amount)
+            }
         }?;
 
         // mutate
@@ -153,7 +160,7 @@ impl AccountState {
     /// 1. total = available + held
     ///
     /// NOTE: available can get negative here.
-    fn _dispute(&mut self, amount: Decimal) -> Result<(), StateError> {
+    fn _dispute_deposit(&mut self, amount: Decimal) -> Result<(), StateError> {
         let held = self
             .held
             .checked_add(amount)
@@ -175,7 +182,7 @@ impl AccountState {
     ///
     /// TODO: held does never go below 0 due to the dispute transition logic,
     /// though I'd like to encapsulate invariant checking.
-    fn _resolve(&mut self, amount: Decimal) -> Result<(), StateError> {
+    fn _resolve_deposit(&mut self, amount: Decimal) -> Result<(), StateError> {
         let held = self
             .held
             .checked_sub(amount)
@@ -199,7 +206,7 @@ impl AccountState {
     /// TODO: held does never go below 0 due to the dispute transition logic,
     /// though I'd like to encapsulate invariant checking.
     /// NOTE: total can get negative here.
-    fn _charge_back(&mut self, amount: Decimal) -> Result<(), StateError> {
+    fn _charge_back_deposit(&mut self, amount: Decimal) -> Result<(), StateError> {
         let held = self
             .held
             .checked_sub(amount)
@@ -211,6 +218,71 @@ impl AccountState {
 
         self.held = held;
         self.total = total;
+        self.locked = true;
+
+        Ok(())
+    }
+
+    /// Maintain invariants:
+    ///
+    /// 1. total = available + held
+    fn _dispute_withdrawal(&mut self, amount: Decimal) -> Result<(), StateError> {
+        let held = self
+            .held
+            .checked_add(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let total = self
+            .total
+            .checked_add(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.total = total;
+
+        Ok(())
+    }
+
+    /// Maintain invariants:
+    ///
+    /// 1. total = available + held
+    ///
+    /// TODO: held does never go below 0 due to the dispute transition logic,
+    /// though I'd like to encapsulate invariant checking.
+    fn _resolve_withdrawal(&mut self, amount: Decimal) -> Result<(), StateError> {
+        let held = self
+            .held
+            .checked_sub(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let total = self
+            .total
+            .checked_sub(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.total = total;
+
+        Ok(())
+    }
+
+    /// Maintain invariants:
+    ///
+    /// 1. total = available + held
+    /// 2. chargeback locks account
+    ///
+    /// TODO: held does never go below 0 due to the dispute transition logic,
+    /// though I'd like to encapsulate invariant checking.
+    fn _charge_back_withdrawal(&mut self, amount: Decimal) -> Result<(), StateError> {
+        let held = self
+            .held
+            .checked_sub(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let available = self
+            .available
+            .checked_add(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.available = available;
         self.locked = true;
 
         Ok(())
@@ -336,12 +408,13 @@ mod tests {
         store
     }
 
-    fn advance_dispute(
+    fn apply_dispute(
+        transaction_kind: TransactionKind,
         state: DisputeState,
         kind: DisputeKind,
-    ) -> (Result<(), StateError>, DisputeState) {
-        let mut transaction = TransactionState {
-            kind: TransactionKind::Deposit,
+    ) -> (Result<DisputeState, StateError>, AccountState) {
+        let transaction = TransactionState {
+            kind: transaction_kind,
             client: ClientId(42),
             amount: dec!(10),
             dispute_state: state,
@@ -352,8 +425,31 @@ mod tests {
             tx: TxId(123),
         };
 
-        let result = transaction.advance_dispute_state(&dispute);
-        (result, transaction.dispute_state)
+        let mut account = AccountState {
+            available: dec!(10),
+            held: dec!(10),
+            total: dec!(20),
+            locked: false,
+        };
+        let result = account
+            .apply_dispute(transaction, &dispute)
+            .map(|transaction| transaction.dispute_state);
+        (result, account)
+    }
+
+    fn assert_dispute_rejected(state: DisputeState, kind: DisputeKind) {
+        let (result, account) = apply_dispute(TransactionKind::Deposit, state, kind);
+
+        assert_eq!(result.unwrap_err(), StateError::InvalidDisputeTransition);
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(10), dec!(10), dec!(20), false)
+        );
     }
 
     #[test]
@@ -372,17 +468,17 @@ mod tests {
         account._withdraw(dec!(2.1234)).unwrap();
         assert_balances(&account, dec!(8), dec!(0), dec!(8));
 
-        account._dispute(dec!(3)).unwrap();
+        account._dispute_deposit(dec!(3)).unwrap();
         assert_balances(&account, dec!(5), dec!(3), dec!(8));
 
-        account._resolve(dec!(3)).unwrap();
+        account._resolve_deposit(dec!(3)).unwrap();
         assert_balances(&account, dec!(8), dec!(0), dec!(8));
         assert!(!account.locked);
 
-        account._dispute(dec!(4)).unwrap();
+        account._dispute_deposit(dec!(4)).unwrap();
         assert_balances(&account, dec!(4), dec!(4), dec!(8));
 
-        account._charge_back(dec!(4)).unwrap();
+        account._charge_back_deposit(dec!(4)).unwrap();
         assert_balances(&account, dec!(4), dec!(0), dec!(4));
         assert!(account.locked);
     }
@@ -409,74 +505,186 @@ mod tests {
 
     #[test]
     fn opening_nondisputed_transaction_marks_it_disputed() {
-        let (result, state) = advance_dispute(DisputeState::NonDisputed, DisputeKind::Open);
+        let (result, account) = apply_dispute(
+            TransactionKind::Deposit,
+            DisputeState::NonDisputed,
+            DisputeKind::Open,
+        );
 
-        assert_eq!(result, Ok(()));
-        assert!(matches!(state, DisputeState::Disputed));
+        assert!(matches!(result.unwrap(), DisputeState::Disputed));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(0), dec!(20), dec!(20), false)
+        );
     }
 
     #[test]
     fn resolving_disputed_transaction_marks_it_nondisputed() {
-        let (result, state) = advance_dispute(DisputeState::Disputed, DisputeKind::Resolve);
+        let (result, account) = apply_dispute(
+            TransactionKind::Deposit,
+            DisputeState::Disputed,
+            DisputeKind::Resolve,
+        );
 
-        assert_eq!(result, Ok(()));
-        assert!(matches!(state, DisputeState::NonDisputed));
+        assert!(matches!(result.unwrap(), DisputeState::NonDisputed));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(20), dec!(0), dec!(20), false)
+        );
     }
 
     #[test]
-    fn charging_back_disputed_transaction_marks_it_charged_back() {
-        let (result, state) = advance_dispute(DisputeState::Disputed, DisputeKind::ChargeBack);
+    fn charging_back_disputed_transaction_marks_it_reverted() {
+        let (result, account) = apply_dispute(
+            TransactionKind::Deposit,
+            DisputeState::Disputed,
+            DisputeKind::ChargeBack,
+        );
 
-        assert_eq!(result, Ok(()));
-        assert!(matches!(state, DisputeState::ChargeBack));
+        assert!(matches!(result.unwrap(), DisputeState::Reverted));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(10), dec!(0), dec!(10), true)
+        );
     }
 
     #[test]
-    fn resolving_nondisputed_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::NonDisputed, DisputeKind::Resolve);
+    fn opening_withdrawal_dispute_adds_held_and_total() {
+        let (result, account) = apply_dispute(
+            TransactionKind::Withdrawal,
+            DisputeState::NonDisputed,
+            DisputeKind::Open,
+        );
 
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::NonDisputed));
+        assert!(matches!(result.unwrap(), DisputeState::Disputed));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(10), dec!(20), dec!(30), false)
+        );
     }
 
     #[test]
-    fn charging_back_nondisputed_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::NonDisputed, DisputeKind::ChargeBack);
+    fn resolving_withdrawal_dispute_subtracts_held_and_total() {
+        let (result, account) = apply_dispute(
+            TransactionKind::Withdrawal,
+            DisputeState::Disputed,
+            DisputeKind::Resolve,
+        );
 
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::NonDisputed));
+        assert!(matches!(result.unwrap(), DisputeState::NonDisputed));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(10), dec!(0), dec!(10), false)
+        );
     }
 
     #[test]
-    fn opening_disputed_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::Disputed, DisputeKind::Open);
+    fn charging_back_withdrawal_returns_held_funds_to_available() {
+        let (result, account) = apply_dispute(
+            TransactionKind::Withdrawal,
+            DisputeState::Disputed,
+            DisputeKind::ChargeBack,
+        );
 
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::Disputed));
+        assert!(matches!(result.unwrap(), DisputeState::Reverted));
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (dec!(20), dec!(0), dec!(20), true)
+        );
     }
 
     #[test]
-    fn opening_charged_back_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::ChargeBack, DisputeKind::Open);
+    fn withdrawal_dispute_total_overflow_leaves_account_unchanged() {
+        let mut account = AccountState {
+            available: Decimal::MAX,
+            held: Decimal::ZERO,
+            total: Decimal::MAX,
+            locked: false,
+        };
+        let transaction = TransactionState {
+            kind: TransactionKind::Withdrawal,
+            client: ClientId(42),
+            amount: Decimal::ONE,
+            dispute_state: DisputeState::NonDisputed,
+        };
+        let dispute = Dispute {
+            kind: DisputeKind::Open,
+            client: ClientId(42),
+            tx: TxId(123),
+        };
 
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::ChargeBack));
+        let result = account.apply_dispute(transaction, &dispute);
+
+        assert_eq!(result.unwrap_err(), StateError::ArithmeticOverflow);
+        assert_eq!(
+            (
+                account.available,
+                account.held,
+                account.total,
+                account.locked
+            ),
+            (Decimal::MAX, Decimal::ZERO, Decimal::MAX, false)
+        );
     }
 
     #[test]
-    fn resolving_charged_back_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::ChargeBack, DisputeKind::Resolve);
-
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::ChargeBack));
+    fn resolving_nondisputed_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::NonDisputed, DisputeKind::Resolve);
     }
 
     #[test]
-    fn charging_back_charged_back_transaction_fails_without_changing_state() {
-        let (result, state) = advance_dispute(DisputeState::ChargeBack, DisputeKind::ChargeBack);
+    fn charging_back_nondisputed_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::NonDisputed, DisputeKind::ChargeBack);
+    }
 
-        assert_eq!(result, Err(StateError::InvalidDisputeTransition));
-        assert!(matches!(state, DisputeState::ChargeBack));
+    #[test]
+    fn opening_disputed_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::Disputed, DisputeKind::Open);
+    }
+
+    #[test]
+    fn opening_reverted_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::Reverted, DisputeKind::Open);
+    }
+
+    #[test]
+    fn resolving_reverted_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::Reverted, DisputeKind::Resolve);
+    }
+
+    #[test]
+    fn charging_back_reverted_transaction_fails_without_changing_account() {
+        assert_dispute_rejected(DisputeState::Reverted, DisputeKind::ChargeBack);
     }
 
     #[test]
