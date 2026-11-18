@@ -97,7 +97,7 @@ impl AccountState {
         dispute: &Dispute,
     ) -> Result<(), StateError> {
         // validate
-        if !tx.is_dispute_transition_valid(&dispute) {
+        if !tx.is_dispute_transition_valid(dispute) {
             return Err(StateError::InvalidDisputeTransition);
         }
 
@@ -118,7 +118,7 @@ impl AccountState {
         }?;
 
         // mutate
-        tx.transition_dispute_state(&dispute);
+        tx.transition_dispute_state(dispute);
         Ok(())
     }
 
@@ -323,7 +323,7 @@ impl Store {
     /// Note: clones internal state
     pub fn accounts(&self) -> impl Iterator<Item = Account> {
         self.accounts.iter().map(|(client, state)| Account {
-            client: client.clone(),
+            client: *client,
             available: state.available,
             held: state.held,
             total: state.total,

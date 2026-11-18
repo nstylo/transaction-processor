@@ -2,6 +2,8 @@
 
 ## Build the Project
 
+Requires Rust 1.85 or newer and Cargo (Rust edition 2024).
+
 ```sh
 cargo build
 ```
