@@ -66,6 +66,17 @@ impl TransactionState {
     }
 }
 
+impl From<Transaction> for TransactionState {
+    fn from(tx: Transaction) -> Self {
+        Self {
+            kind: tx.kind,
+            client: tx.client,
+            amount: tx.amount,
+            dispute_state: DisputeState::default(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct AccountState {
     available: Decimal,
@@ -75,7 +86,7 @@ struct AccountState {
 }
 
 impl AccountState {
-    pub fn apply_tx(&mut self, tx: Transaction) -> Result<(), StateError> {
+    pub fn apply_tx(&mut self, tx: &Transaction) -> Result<(), StateError> {
         match tx.kind {
             TransactionKind::Deposit => self._deposit(tx.amount),
             TransactionKind::Withdrawal => self._withdraw(tx.amount),
@@ -343,11 +354,17 @@ impl Store {
             return Err(StateError::AccountLocked);
         }
 
-        self.accounts.entry(tx.client).or_default().apply_tx(tx)
+        self.accounts.entry(tx.client).or_default().apply_tx(&tx)?;
+        self.transactions.insert(tx.tx, TransactionState::from(tx));
+
+        Ok(())
     }
 
     fn _apply_dispute(&mut self, dispute: Dispute) -> Result<(), StateError> {
         // TODO: can a locked account dispute? I think it should.
+        //
+        // Assumption: dispute.client == tx.client since if a client id can be wrong, we have
+        // no way of determining which of the client ids is the right one.
 
         // 1. check if transaction exists
         let tx = self

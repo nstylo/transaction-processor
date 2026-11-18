@@ -4,6 +4,49 @@ use crate::domain::{
 };
 use rust_decimal::Decimal;
 use serde::{self, Deserialize, Serialize};
+use std::io;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ReadOperationError {
+    #[error(transparent)]
+    Csv(#[from] csv::Error),
+    #[error("{0}")]
+    InvalidOperation(&'static str),
+}
+
+#[derive(Debug, Error)]
+pub enum WriteOperationError {
+    #[error("failed to serialize account CSV: {0}")]
+    Serialize(#[from] csv::Error),
+    #[error("failed to flush account CSV: {0}")]
+    Flush(#[from] io::Error),
+}
+
+pub fn read_operations<R: io::Read>(
+    reader: R,
+) -> impl Iterator<Item = Result<Operation, ReadOperationError>> {
+    csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(reader)
+        .into_deserialize::<OperationRow>()
+        .map(|row| {
+            let row = row?;
+            row.try_into().map_err(ReadOperationError::InvalidOperation)
+        })
+}
+
+pub fn write_accounts<W: io::Write>(
+    accounts: impl IntoIterator<Item = Account>,
+    writer: &mut csv::Writer<W>,
+) -> Result<(), WriteOperationError> {
+    for account in accounts {
+        // handles writing header
+        writer.serialize(AccountRow::from(account))?;
+    }
+
+    Ok(writer.flush()?)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,6 +78,8 @@ impl TryFrom<OperationRow> for Operation {
                 let amount = row
                     .amount
                     .ok_or("Deposit transaction is missing amount.")?
+                    // TODO: we ensure 4 decimals at the read boundary, it would be cool to have
+                    // have the precision embedded in the type.
                     .trunc_with_scale(DECIMAL_PRECISION);
 
                 Ok(Self::Transaction(Transaction {
