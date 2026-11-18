@@ -3,7 +3,11 @@ mod serde;
 mod state;
 
 use clap::{Arg, Command, value_parser};
-use std::{io, path::PathBuf, println};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    println,
+};
 
 use crate::{
     domain::Operation,
@@ -34,26 +38,32 @@ fn main() -> io::Result<()> {
 
     for row in reader.into_deserialize::<OperationRow>() {
         let op: Result<Operation, &'static str> = row?.try_into();
-        println!("{:?}", op);
         match op {
             Ok(op) => match store.apply_operation(op) {
                 Ok(()) => {}
                 Err(err) => {
-                    println!("{:?}", err);
+                    eprintln!("{:?}", err);
                 }
             },
             Err(err) => {
-                println!("{:?}", err);
+                eprintln!("{:?}", err);
             }
         }
     }
 
-    for account in store.accounts() {
-        let row: AccountRow = account.into();
-        println!("{:?}", row);
-    }
-
-    let _output = io::stdout().lock();
+    let mut output = io::stdout().lock();
+    let buffer = accounts_csv(&store).unwrap();
+    output.write_all(&buffer)?;
 
     Ok(())
+}
+
+fn accounts_csv(store: &Store) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut writer = csv::WriterBuilder::new().from_writer(vec![]);
+
+    for account in store.accounts() {
+        writer.serialize(AccountRow::from(account))?;
+    }
+
+    Ok(writer.into_inner()?)
 }
