@@ -23,6 +23,8 @@ pub enum WriteOperationError {
     Flush(#[from] io::Error),
 }
 
+/// streams csv file line by line instead of reading the whole file
+/// into memory.
 pub fn read_operations<R: io::Read>(
     reader: R,
 ) -> impl Iterator<Item = Result<Operation, ReadOperationError>> {
@@ -66,6 +68,7 @@ pub struct OperationRow {
     client: u16,
     tx: u32,
     // TODO: would love to make amount an unsigned decimal
+    #[serde(default, deserialize_with = "decimal_truncate::deserialize_optional")]
     amount: Option<Decimal>,
 }
 
@@ -75,12 +78,7 @@ impl TryFrom<OperationRow> for Operation {
     fn try_from(row: OperationRow) -> Result<Self, Self::Error> {
         match row.kind {
             OperationKind::Deposit => {
-                let amount = row
-                    .amount
-                    .ok_or("Deposit transaction is missing amount.")?
-                    // TODO: we ensure 4 decimals at the read boundary, it would be cool to have
-                    // have the precision embedded in the type.
-                    .trunc_with_scale(DECIMAL_PRECISION);
+                let amount = row.amount.ok_or("Deposit transaction is missing amount.")?;
 
                 Ok(Self::Transaction(Transaction {
                     kind: TransactionKind::Deposit,
@@ -92,8 +90,7 @@ impl TryFrom<OperationRow> for Operation {
             OperationKind::Withdrawal => {
                 let amount = row
                     .amount
-                    .ok_or("Withdrawal transaction is missing amount.")?
-                    .trunc_with_scale(DECIMAL_PRECISION);
+                    .ok_or("Withdrawal transaction is missing amount.")?;
 
                 Ok(Self::Transaction(Transaction {
                     kind: TransactionKind::Withdrawal,
@@ -124,20 +121,41 @@ impl TryFrom<OperationRow> for Operation {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct AccountRow {
     pub client: u16,
-    #[serde(deserialize_with = "decimal_from_text")]
+    #[serde(with = "decimal_truncate")]
     pub available: Decimal,
-    #[serde(deserialize_with = "decimal_from_text")]
+    #[serde(with = "decimal_truncate")]
     pub held: Decimal,
-    #[serde(deserialize_with = "decimal_from_text")]
+    #[serde(with = "decimal_truncate")]
     pub total: Decimal,
     pub locked: bool,
 }
 
-fn decimal_from_text<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Decimal, D::Error> {
-    let text = String::deserialize(deserializer)?;
-    Decimal::from_str_exact(&text).map_err(serde::de::Error::custom)
+mod decimal_truncate {
+    use super::{DECIMAL_PRECISION, Decimal};
+    use ::serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse(&text)
+    }
+
+    pub fn deserialize_optional<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Decimal>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| parse(&text))
+            .transpose()
+    }
+
+    pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&value.trunc_with_scale(DECIMAL_PRECISION))
+    }
+
+    fn parse<E: Error>(text: &str) -> Result<Decimal, E> {
+        Decimal::from_str_exact(text)
+            .map(|decimal| decimal.trunc_with_scale(DECIMAL_PRECISION))
+            .map_err(E::custom)
+    }
 }
 
 impl From<Account> for AccountRow {
@@ -166,6 +184,59 @@ mod tests {
             client: 42,
             tx: 123,
             amount,
+        }
+    }
+
+    #[test]
+    fn decimal_text_is_parsed_exactly_then_truncated() {
+        for (input, expected) in [
+            ("9007199254740993.12349", "9007199254740993.1234"),
+            ("1.99999999999999999", "1.9999"),
+            ("-1.99999999999999999", "-1.9999"),
+            ("+0001.23459", "1.2345"),
+            (".123456", "0.1234"),
+            ("1.", "1"),
+            ("-0.00009", "0"),
+            (
+                "79228162514264337593543950335",
+                "79228162514264337593543950335",
+            ),
+        ] {
+            let result: Result<Decimal, ::serde::de::value::Error> =
+                super::decimal_truncate::deserialize(::serde::de::value::StrDeserializer::new(
+                    input,
+                ));
+            assert_eq!(
+                result.unwrap(),
+                Decimal::from_str_exact(expected).unwrap(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_text_rejects_invalid_suffixes_and_unrepresentable_values() {
+        for input in [
+            "1.2345garbage",
+            "1.2345.6",
+            "1.2345-6",
+            "1.2345９",
+            "+-1.2345",
+            "",
+            ".",
+            "+",
+            "-",
+            "1.999999999999999999999999999999999999",
+            "-1.999999999999999999999999999999999999",
+            "79228162514264337593543950336",
+            "79228162514264337593543950335.0001",
+            "79228162514264337593543950335.00009",
+        ] {
+            let result: Result<Decimal, ::serde::de::value::Error> =
+                super::decimal_truncate::deserialize(::serde::de::value::StrDeserializer::new(
+                    input,
+                ));
+            assert!(result.is_err(), "invalid input was accepted: {input}");
         }
     }
 
