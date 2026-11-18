@@ -55,14 +55,12 @@ impl TransactionState {
     }
 
     /// IMPORTANT: validate if transition is valid, before applying it.
-    pub fn transition_dispute_state(mut self, dispute: &Dispute) -> Self {
+    pub fn transition_dispute_state(&mut self, dispute: &Dispute) {
         self.dispute_state = match dispute.kind {
             DisputeKind::Open => DisputeState::Disputed,
             DisputeKind::Resolve => DisputeState::NonDisputed,
             DisputeKind::ChargeBack => DisputeState::Reverted,
         };
-
-        self
     }
 }
 
@@ -95,9 +93,9 @@ impl AccountState {
 
     pub fn apply_dispute(
         &mut self,
-        tx: TransactionState,
+        tx: &mut TransactionState,
         dispute: &Dispute,
-    ) -> Result<TransactionState, StateError> {
+    ) -> Result<(), StateError> {
         // validate
         if !tx.is_dispute_transition_valid(&dispute) {
             return Err(StateError::InvalidDisputeTransition);
@@ -120,7 +118,8 @@ impl AccountState {
         }?;
 
         // mutate
-        Ok(tx.transition_dispute_state(&dispute))
+        tx.transition_dispute_state(&dispute);
+        Ok(())
     }
 
     /// Maintain invariants:
@@ -369,7 +368,7 @@ impl Store {
         // 1. check if transaction exists
         let tx = self
             .transactions
-            .remove(&dispute.tx)
+            .get_mut(&dispute.tx)
             .ok_or(StateError::TransactionNotFound)?;
 
         // 2. this should never happen. Could unwrap, but this let's defensively return a recoverable error.
@@ -378,8 +377,7 @@ impl Store {
             .get_mut(&tx.client)
             .ok_or(StateError::AccountNotFound)?;
 
-        let tx = account.apply_dispute(tx, &dispute)?;
-        self.transactions.insert(dispute.tx, tx);
+        account.apply_dispute(tx, &dispute)?;
 
         Ok(())
     }
@@ -430,7 +428,7 @@ mod tests {
         state: DisputeState,
         kind: DisputeKind,
     ) -> (Result<DisputeState, StateError>, AccountState) {
-        let transaction = TransactionState {
+        let mut transaction = TransactionState {
             kind: transaction_kind,
             client: ClientId(42),
             amount: dec!(10),
@@ -448,10 +446,9 @@ mod tests {
             total: dec!(20),
             locked: false,
         };
-        let result = account
-            .apply_dispute(transaction, &dispute)
-            .map(|transaction| transaction.dispute_state);
-        (result, account)
+
+        let result = account.apply_dispute(&mut transaction, &dispute);
+        (result.map(|_| transaction.dispute_state), account)
     }
 
     fn assert_dispute_rejected(state: DisputeState, kind: DisputeKind) {
@@ -648,7 +645,7 @@ mod tests {
             total: Decimal::MAX,
             locked: false,
         };
-        let transaction = TransactionState {
+        let mut transaction = TransactionState {
             kind: TransactionKind::Withdrawal,
             client: ClientId(42),
             amount: Decimal::ONE,
@@ -660,7 +657,7 @@ mod tests {
             tx: TxId(123),
         };
 
-        let result = account.apply_dispute(transaction, &dispute);
+        let result = account.apply_dispute(&mut transaction, &dispute);
 
         assert_eq!(result.unwrap_err(), StateError::ArithmeticOverflow);
         assert_eq!(
@@ -799,6 +796,235 @@ mod tests {
         assert_eq!(
             store.apply_operation(dispute(DisputeKind::Open)),
             Err(StateError::AccountNotFound)
+        );
+    }
+    fn account(available: Decimal, held: Decimal, total: Decimal) -> AccountState {
+        AccountState {
+            available,
+            held,
+            total,
+            locked: false,
+        }
+    }
+
+    fn balances(account: &AccountState) -> (Decimal, Decimal, Decimal, bool) {
+        (
+            account.available,
+            account.held,
+            account.total,
+            account.locked,
+        )
+    }
+
+    fn assert_overflow_unchanged(
+        operation: fn(&mut AccountState, Decimal) -> Result<(), StateError>,
+        mut account: AccountState,
+    ) {
+        let before = balances(&account);
+        assert_eq!(
+            operation(&mut account, Decimal::ONE),
+            Err(StateError::ArithmeticOverflow)
+        );
+        assert_eq!(balances(&account), before);
+    }
+
+    #[test]
+    fn deposit_overflow_preserves_all_balances() {
+        assert_overflow_unchanged(
+            AccountState::_deposit,
+            account(Decimal::MAX, Decimal::ZERO, Decimal::MAX),
+        );
+        assert_overflow_unchanged(
+            AccountState::_deposit,
+            account(Decimal::MAX - Decimal::ONE, Decimal::ONE, Decimal::MAX),
+        );
+    }
+
+    #[test]
+    fn withdrawal_arithmetic_limits_preserve_state() {
+        let mut boundary = account(Decimal::MAX, Decimal::ZERO, Decimal::MAX);
+        boundary._withdraw(Decimal::MAX).unwrap();
+        assert_eq!(
+            balances(&boundary),
+            (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, false)
+        );
+
+        // Available cannot underflow: insufficient funds is checked before subtraction.
+        assert_eq!(
+            boundary._withdraw(Decimal::ONE),
+            Err(StateError::InsufficientFunds)
+        );
+        assert_eq!(
+            balances(&boundary),
+            (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, false)
+        );
+
+        // Seed inconsistent internal balances to exercise the defensive total check.
+        assert_overflow_unchanged(
+            AccountState::_withdraw,
+            account(Decimal::ONE, Decimal::ZERO, Decimal::MIN),
+        );
+    }
+
+    #[test]
+    fn deposit_dispute_overflow_preserves_all_balances() {
+        assert_overflow_unchanged(
+            AccountState::_dispute_deposit,
+            account(Decimal::MIN, Decimal::MAX, Decimal::ZERO),
+        );
+        assert_overflow_unchanged(
+            AccountState::_dispute_deposit,
+            account(Decimal::MIN, Decimal::ZERO, Decimal::MIN),
+        );
+    }
+
+    #[test]
+    fn deposit_resolve_overflow_preserves_all_balances() {
+        // Direct fixtures also cover arithmetic checks on inconsistent internal state.
+        assert_overflow_unchanged(
+            AccountState::_resolve_deposit,
+            account(Decimal::MAX, Decimal::MIN, Decimal::ZERO),
+        );
+        assert_overflow_unchanged(
+            AccountState::_resolve_deposit,
+            account(Decimal::MAX, Decimal::ONE, Decimal::MAX),
+        );
+    }
+
+    #[test]
+    fn deposit_chargeback_overflow_preserves_all_balances_and_lock() {
+        assert_overflow_unchanged(
+            AccountState::_charge_back_deposit,
+            account(Decimal::MAX, Decimal::MIN, Decimal::ZERO),
+        );
+        assert_overflow_unchanged(
+            AccountState::_charge_back_deposit,
+            account(Decimal::ZERO, Decimal::ONE, Decimal::MIN),
+        );
+    }
+
+    #[test]
+    fn withdrawal_dispute_overflow_preserves_all_balances() {
+        assert_overflow_unchanged(
+            AccountState::_dispute_withdrawal,
+            account(Decimal::ZERO, Decimal::MAX, Decimal::MAX),
+        );
+        assert_overflow_unchanged(
+            AccountState::_dispute_withdrawal,
+            account(Decimal::MAX, Decimal::ZERO, Decimal::MAX),
+        );
+    }
+
+    #[test]
+    fn withdrawal_resolve_overflow_preserves_all_balances() {
+        assert_overflow_unchanged(
+            AccountState::_resolve_withdrawal,
+            account(Decimal::ZERO, Decimal::MIN, Decimal::MIN),
+        );
+        assert_overflow_unchanged(
+            AccountState::_resolve_withdrawal,
+            account(Decimal::ZERO, Decimal::ONE, Decimal::MIN),
+        );
+    }
+
+    #[test]
+    fn withdrawal_chargeback_overflow_preserves_all_balances_and_lock() {
+        assert_overflow_unchanged(
+            AccountState::_charge_back_withdrawal,
+            account(Decimal::MAX, Decimal::MIN, Decimal::ZERO),
+        );
+        assert_overflow_unchanged(
+            AccountState::_charge_back_withdrawal,
+            account(Decimal::MAX, Decimal::ONE, Decimal::MAX),
+        );
+    }
+
+    #[test]
+    fn rejected_dispute_preserves_transaction_history() {
+        let mut store = Store::new();
+        store
+            .apply_operation(Operation::Transaction(Transaction {
+                kind: TransactionKind::Deposit,
+                client: ClientId(1),
+                tx: TxId(1),
+                amount: Decimal::ONE,
+            }))
+            .unwrap();
+        let before = balances(store.accounts.get(&ClientId(1)).unwrap());
+
+        assert_eq!(
+            store.apply_operation(Operation::Dispute(Dispute {
+                kind: DisputeKind::Resolve,
+                client: ClientId(1),
+                tx: TxId(1),
+            })),
+            Err(StateError::InvalidDisputeTransition)
+        );
+        assert_eq!(balances(store.accounts.get(&ClientId(1)).unwrap()), before);
+        assert!(
+            store.transactions.contains_key(&TxId(1)),
+            "rejection must retain transaction history"
+        );
+    }
+
+    #[test]
+    fn dispute_overflow_preserves_transaction_history() {
+        let mut store = Store::new();
+        store.accounts.insert(
+            ClientId(1),
+            account(Decimal::MAX, Decimal::ZERO, Decimal::MAX),
+        );
+        store.transactions.insert(
+            TxId(1),
+            TransactionState {
+                kind: TransactionKind::Withdrawal,
+                client: ClientId(1),
+                amount: Decimal::ONE,
+                dispute_state: DisputeState::NonDisputed,
+            },
+        );
+        let before = balances(store.accounts.get(&ClientId(1)).unwrap());
+
+        assert_eq!(
+            store.apply_operation(Operation::Dispute(Dispute {
+                kind: DisputeKind::Open,
+                client: ClientId(1),
+                tx: TxId(1),
+            })),
+            Err(StateError::ArithmeticOverflow)
+        );
+        assert_eq!(balances(store.accounts.get(&ClientId(1)).unwrap()), before);
+        assert!(
+            store.transactions.contains_key(&TxId(1)),
+            "overflow must retain transaction history"
+        );
+    }
+
+    #[test]
+    fn missing_account_preserves_transaction_history() {
+        let mut store = Store::new();
+        store.transactions.insert(
+            TxId(1),
+            TransactionState {
+                kind: TransactionKind::Deposit,
+                client: ClientId(1),
+                amount: Decimal::ONE,
+                dispute_state: DisputeState::NonDisputed,
+            },
+        );
+
+        assert_eq!(
+            store.apply_operation(Operation::Dispute(Dispute {
+                kind: DisputeKind::Open,
+                client: ClientId(1),
+                tx: TxId(1),
+            })),
+            Err(StateError::AccountNotFound)
+        );
+        assert!(store.accounts.is_empty());
+        assert!(
+            store.transactions.contains_key(&TxId(1)),
+            "missing account must not discard history"
         );
     }
 }

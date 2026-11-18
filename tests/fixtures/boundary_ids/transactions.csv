@@ -1,0 +1,4 @@
+type,client,tx,amount
+deposit,0,0,1
+deposit,65535,4294967295,2
+withdrawal,0,4294967294,0.0001

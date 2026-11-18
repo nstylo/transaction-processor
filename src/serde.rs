@@ -121,13 +121,23 @@ impl TryFrom<OperationRow> for Operation {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct AccountRow {
-    client: u16,
-    available: Decimal,
-    held: Decimal,
-    total: Decimal,
-    locked: bool,
+    pub client: u16,
+    #[serde(deserialize_with = "decimal_from_text")]
+    pub available: Decimal,
+    #[serde(deserialize_with = "decimal_from_text")]
+    pub held: Decimal,
+    #[serde(deserialize_with = "decimal_from_text")]
+    pub total: Decimal,
+    pub locked: bool,
+}
+
+fn decimal_from_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Decimal, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    Decimal::from_str_exact(&text).map_err(serde::de::Error::custom)
 }
 
 impl From<Account> for AccountRow {

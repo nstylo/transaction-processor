@@ -1,16 +1,5 @@
-use rust_decimal::Decimal;
-use serde::Deserialize;
 use std::{fs, io::Cursor, path::Path};
-use transaction_processor::{Store, run};
-
-#[derive(Debug, Deserialize, PartialEq)]
-struct AccountRecord {
-    client: u16,
-    available: Decimal,
-    held: Decimal,
-    total: Decimal,
-    locked: bool,
-}
+use transaction_processor::{Store, run, serde::AccountRow};
 
 fn assert_fixture(name: &str) {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -31,16 +20,9 @@ fn assert_fixture(name: &str) {
     );
 }
 
-fn account_records(input: &[u8]) -> Vec<AccountRecord> {
+fn account_records(input: &[u8]) -> Vec<AccountRow> {
     let mut reader = csv::Reader::from_reader(input);
-    assert_eq!(
-        reader
-            .headers()
-            .expect("account CSV should contain a header"),
-        &csv::StringRecord::from(vec!["client", "available", "held", "total", "locked"])
-    );
-
-    let mut accounts: Vec<AccountRecord> = reader
+    let mut accounts: Vec<AccountRow> = reader
         .deserialize()
         .collect::<Result<_, _>>()
         .expect("account CSV should deserialize");
@@ -48,22 +30,102 @@ fn account_records(input: &[u8]) -> Vec<AccountRecord> {
     accounts
 }
 
-#[test]
-fn deposits_and_withdrawals_produce_account_csv_in_memory() {
-    assert_fixture("basic");
+macro_rules! fixture_tests {
+    ($($case:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $case() {
+                assert_fixture(stringify!($case));
+            }
+        )*
+    };
 }
 
-#[test]
-fn deposit_disputes_produce_account_csv_in_memory() {
-    assert_fixture("deposit_disputes");
-}
-
-#[test]
-fn withdrawal_disputes_produce_account_csv_in_memory() {
-    assert_fixture("withdrawal_disputes");
-}
-
-#[test]
-fn rejected_operations_do_not_prevent_processing_later_rows() {
-    assert_fixture("rejected_operations");
-}
+fixture_tests!(
+    basic,
+    deposit_disputes,
+    withdrawal_disputes,
+    rejected_operations,
+    simple_condensed,
+    simple_whitespace_truncated,
+    complex_without_disputes,
+    deposit_dispute_resolve,
+    deposit_dispute_chargeback,
+    withdrawal_dispute_resolve,
+    withdrawal_dispute_chargeback,
+    complex_multiclient_disputes,
+    deposit_dispute_reopened,
+    withdrawal_dispute_reopened,
+    simultaneous_disputes,
+    mixed_disputes_same_account,
+    partial_resolution_retains_other_hold,
+    partial_chargeback_retains_other_hold,
+    negative_available_after_deposit_dispute,
+    negative_total_after_deposit_chargeback,
+    withdrawal_exact_available,
+    minimum_positive_amount,
+    large_decimal_precision,
+    truncation_carry_boundaries,
+    boundary_ids,
+    interleaved_nonmonotonic_ids,
+    missing_deposit_amount,
+    missing_withdrawal_amount,
+    zero_deposit,
+    zero_withdrawal,
+    negative_deposit,
+    negative_withdrawal,
+    deposit_truncated_to_zero,
+    withdrawal_truncated_to_zero,
+    withdrawal_exceeds_available,
+    held_funds_not_withdrawable,
+    withdrawal_before_funding,
+    duplicate_deposit_id,
+    duplicate_withdrawal_id,
+    withdrawal_reuses_deposit_id,
+    deposit_reuses_withdrawal_id,
+    duplicate_id_across_clients,
+    rejected_transaction_id_reusable,
+    missing_amount_id_reusable,
+    resolved_transaction_id_reserved,
+    reverted_transaction_id_reserved,
+    deposit_into_locked_account,
+    withdrawal_from_locked_account,
+    dispute_unknown_transaction,
+    resolve_unknown_transaction,
+    chargeback_unknown_transaction,
+    deposit_resolve_before_dispute_retains_history,
+    deposit_chargeback_before_dispute_retains_history,
+    deposit_duplicate_dispute_retains_history,
+    deposit_repeated_resolve_retains_history,
+    deposit_dispute_after_chargeback_retains_history,
+    deposit_resolve_after_chargeback_retains_history,
+    deposit_chargeback_after_chargeback_retains_history,
+    deposit_dispute_amount_ignored,
+    deposit_resolve_amount_ignored,
+    deposit_chargeback_amount_ignored,
+    withdrawal_resolve_before_dispute_retains_history,
+    withdrawal_chargeback_before_dispute_retains_history,
+    withdrawal_duplicate_dispute_retains_history,
+    withdrawal_repeated_resolve_retains_history,
+    withdrawal_dispute_after_chargeback_retains_history,
+    withdrawal_resolve_after_chargeback_retains_history,
+    withdrawal_chargeback_after_chargeback_retains_history,
+    withdrawal_dispute_amount_ignored,
+    withdrawal_resolve_amount_ignored,
+    withdrawal_chargeback_amount_ignored,
+    empty_input,
+    header_only_input,
+    all_operations_rejected,
+    crlf_input,
+    no_final_newline,
+    blank_lines,
+    quoted_fields,
+    output_schema_and_precision,
+    failed_first_withdrawal_creates_zero_account,
+    locked_account_deposit_dispute,
+    locked_account_deposit_resolve,
+    locked_account_deposit_chargeback,
+    locked_account_withdrawal_dispute,
+    locked_account_withdrawal_resolve,
+    locked_account_withdrawal_chargeback,
+);
