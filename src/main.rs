@@ -6,9 +6,17 @@ use std::{fs::File, io, path::PathBuf, println};
 use clap::{Arg, Command, value_parser};
 use rust_decimal::Decimal;
 
+use crate::state::Store;
+
+const DECIMAL_PRECISION: u32 = 4;
+
+// NOTE: could use a type alias, but this makes the intention clear
+// at the time of construction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ClientId(u16);
 
+// NOTE: could use a type alias, but this makes the intention clear
+// at the time of construction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TxId(u32);
 
@@ -58,6 +66,7 @@ enum OperationKind {
 
 #[derive(Debug, Deserialize)]
 struct OperationRow {
+    // 'type' is a reserved keyword
     #[serde(rename = "type")]
     kind: OperationKind,
     client: u16,
@@ -72,7 +81,10 @@ impl TryFrom<OperationRow> for Operation {
     fn try_from(row: OperationRow) -> Result<Self, Self::Error> {
         match row.kind {
             OperationKind::Deposit => {
-                let amount = row.amount.ok_or("Deposit transaction is missing amount.")?;
+                let amount = row
+                    .amount
+                    .ok_or("Deposit transaction is missing amount.")?
+                    .trunc_with_scale(DECIMAL_PRECISION);
 
                 Ok(Self::Transaction(Transaction {
                     kind: TransactionKind::Deposit,

@@ -60,8 +60,12 @@ impl AccountState {
     ///
     /// 1. total = available + held
     fn _deposit(&mut self, amount: Decimal) -> Result<(), &'static str> {
-        self.available += amount;
-        self.total += amount;
+        self.available
+            .checked_add(amount)
+            .ok_or("Critical Error: Overflow.")?;
+        self.total
+            .checked_add(amount)
+            .ok_or("Critical Error: Overflow.")?;
 
         Ok(())
     }
@@ -75,8 +79,12 @@ impl AccountState {
             return Err("Invariant Error: amount > available.");
         }
 
-        self.available -= amount;
-        self.total -= amount;
+        self.available
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
+        self.total
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
 
         Ok(())
     }
@@ -87,8 +95,12 @@ impl AccountState {
     ///
     /// NOTE: available can get negative here.
     fn _dispute(&mut self, amount: Decimal) -> Result<(), &'static str> {
-        self.held += amount;
-        self.available -= amount;
+        self.held
+            .checked_add(amount)
+            .ok_or("Critical Error: Overflow.")?;
+        self.available
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
 
         Ok(())
     }
@@ -100,8 +112,12 @@ impl AccountState {
     /// TODO: held does never go below 0 due to the dispute transition logic,
     /// though I'd like to encapsulate invariant checking.
     fn _resolve(&mut self, amount: Decimal) -> Result<(), &'static str> {
-        self.held -= amount;
-        self.available += amount;
+        self.held
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
+        self.available
+            .checked_add(amount)
+            .ok_or("Critical Error: Overflow.")?;
 
         Ok(())
     }
@@ -115,8 +131,12 @@ impl AccountState {
     /// though I'd like to encapsulate invariant checking.
     /// NOTE: total can get negative here.
     fn _charge_back(&mut self, amount: Decimal) -> Result<(), &'static str> {
-        self.held -= amount;
-        self.total -= amount;
+        self.held
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
+        self.total
+            .checked_sub(amount)
+            .ok_or("Critical Error: Overflow.")?;
         self.locked = true;
 
         Ok(())
@@ -126,6 +146,7 @@ impl AccountState {
 // TODO: we wanna abstract over state store -> trait?
 // The below is an in mem version of the state store
 // TODO: I kinda want to
+#[derive(Default)]
 pub struct Store {
     // Assumption: one account per client, so client id maps directly to account state
     accounts: HashMap<ClientId, AccountState>,
@@ -133,6 +154,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn new() -> Self {
+        Store::default()
+    }
+
     pub fn apply_operation(&mut self, op: Operation) -> Result<(), &'static str> {
         match op {
             Operation::Transaction(transaction) => self._apply_tx(transaction),
