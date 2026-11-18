@@ -26,7 +26,7 @@ pub struct Dispute {
     pub tx: TxId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TransactionKind {
     Deposit,
     Withdrawal,

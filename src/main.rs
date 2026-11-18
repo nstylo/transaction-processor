@@ -5,7 +5,11 @@ mod state;
 use clap::{Arg, Command, value_parser};
 use std::{io, path::PathBuf, println};
 
-use crate::{domain::Operation, serde::OperationRow, state::Store};
+use crate::{
+    domain::Operation,
+    serde::{AccountRow, OperationRow},
+    state::Store,
+};
 
 fn main() -> io::Result<()> {
     let matches = Command::new("Transaction")
@@ -30,6 +34,7 @@ fn main() -> io::Result<()> {
 
     for row in reader.into_deserialize::<OperationRow>() {
         let op: Result<Operation, &'static str> = row?.try_into();
+        println!("{:?}", op);
         match op {
             Ok(op) => match store.apply_operation(op) {
                 Ok(()) => {}
@@ -41,6 +46,11 @@ fn main() -> io::Result<()> {
                 println!("{:?}", err);
             }
         }
+    }
+
+    for account in store.accounts() {
+        let row: AccountRow = account.into();
+        println!("{:?}", row);
     }
 
     let _output = io::stdout().lock();

@@ -1,10 +1,9 @@
 use rust_decimal::{Decimal, dec};
-use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::domain::{
-    ClientId, Dispute, DisputeKind, Operation, Transaction, TransactionKind, TxId,
+    Account, ClientId, Dispute, DisputeKind, Operation, Transaction, TransactionKind, TxId,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -32,11 +31,13 @@ enum DisputeState {
     #[default]
     NonDisputed,
     Disputed,
-    ChargeBack,
+    Reverted,
 }
 
 #[derive(Debug)]
 struct TransactionState {
+    // NOTE: the exercise does not specify the case in which a withdraw transaction
+    // is disputed. We will ha
     kind: TransactionKind,
     client: ClientId,
     amount: Decimal,
@@ -44,21 +45,30 @@ struct TransactionState {
 }
 
 impl TransactionState {
-    /// finite state machine for dispute state:
-    pub fn advance_dispute_state(&mut self, dispute: &Dispute) -> Result<(), StateError> {
-        let new_state = match (&self.dispute_state, &dispute.kind) {
-            (DisputeState::NonDisputed, DisputeKind::Open) => Ok(DisputeState::Disputed),
-            (DisputeState::Disputed, DisputeKind::Resolve) => Ok(DisputeState::NonDisputed),
-            (DisputeState::Disputed, DisputeKind::ChargeBack) => Ok(DisputeState::ChargeBack),
-            (_, _) => Err(StateError::InvalidDisputeTransition),
-        }?;
+    pub fn is_dispute_transition_valid(&self, dispute: &Dispute) -> bool {
+        matches!(
+            (&self.dispute_state, &dispute.kind),
+            (DisputeState::NonDisputed, DisputeKind::Open)
+                | (
+                    DisputeState::Disputed,
+                    DisputeKind::Resolve | DisputeKind::ChargeBack
+                )
+        )
+    }
 
-        self.dispute_state = new_state;
-        Ok(())
+    /// IMPORTANT: validate if transition is valid, before applying it.
+    pub fn transition_dispute_state(mut self, dispute: &Dispute) -> Self {
+        self.dispute_state = match dispute.kind {
+            DisputeKind::Open => DisputeState::Disputed,
+            DisputeKind::Resolve => DisputeState::NonDisputed,
+            DisputeKind::ChargeBack => DisputeState::Reverted,
+        };
+
+        self
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct AccountState {
     available: Decimal,
     held: Decimal,
@@ -74,16 +84,42 @@ impl AccountState {
         }
     }
 
+    pub fn apply_dispute(
+        &mut self,
+        tx: TransactionState,
+        dispute: &Dispute,
+    ) -> Result<TransactionState, StateError> {
+        // validate
+        if !tx.is_dispute_transition_valid(&dispute) {
+            return Err(StateError::InvalidDisputeTransition);
+        }
+
+        // validate and mutate after
+        match dispute.kind {
+            DisputeKind::Open => self._dispute(tx.amount),
+            DisputeKind::Resolve => self._resolve(tx.amount),
+            DisputeKind::ChargeBack => self._charge_back(tx.amount),
+        }?;
+
+        // mutate
+        Ok(tx.transition_dispute_state(&dispute))
+    }
+
     /// Maintain invariants:
     ///
     /// 1. total = available + held
     fn _deposit(&mut self, amount: Decimal) -> Result<(), StateError> {
-        self.available
+        let available = self
+            .available
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
-        self.total
+        let total = self
+            .total
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.available = available;
+        self.total = total;
 
         Ok(())
     }
@@ -97,12 +133,17 @@ impl AccountState {
             return Err(StateError::InsufficientFunds);
         }
 
-        self.available
+        let available = self
+            .available
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
-        self.total
+        let total = self
+            .total
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.available = available;
+        self.total = total;
 
         Ok(())
     }
@@ -113,12 +154,17 @@ impl AccountState {
     ///
     /// NOTE: available can get negative here.
     fn _dispute(&mut self, amount: Decimal) -> Result<(), StateError> {
-        self.held
+        let held = self
+            .held
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
-        self.available
+        let available = self
+            .available
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.available = available;
 
         Ok(())
     }
@@ -130,12 +176,17 @@ impl AccountState {
     /// TODO: held does never go below 0 due to the dispute transition logic,
     /// though I'd like to encapsulate invariant checking.
     fn _resolve(&mut self, amount: Decimal) -> Result<(), StateError> {
-        self.held
+        let held = self
+            .held
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
-        self.available
+        let available = self
+            .available
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.available = available;
 
         Ok(())
     }
@@ -149,12 +200,17 @@ impl AccountState {
     /// though I'd like to encapsulate invariant checking.
     /// NOTE: total can get negative here.
     fn _charge_back(&mut self, amount: Decimal) -> Result<(), StateError> {
-        self.held
+        let held = self
+            .held
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
-        self.total
+        let total = self
+            .total
             .checked_sub(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.held = held;
+        self.total = total;
         self.locked = true;
 
         Ok(())
@@ -180,6 +236,17 @@ impl Store {
             Operation::Transaction(transaction) => self._apply_tx(transaction),
             Operation::Dispute(dispute) => self._apply_dispute(dispute),
         }
+    }
+
+    /// Note: clones internal state
+    pub fn accounts(&self) -> impl Iterator<Item = Account> {
+        self.accounts.iter().map(|(client, state)| Account {
+            client: client.clone(),
+            available: state.available,
+            held: state.held,
+            total: state.total,
+            locked: state.locked,
+        })
     }
 
     fn _apply_tx(&mut self, tx: Transaction) -> Result<(), StateError> {
@@ -213,7 +280,7 @@ impl Store {
         // 1. check if transaction exists
         let tx = self
             .transactions
-            .get_mut(&dispute.tx)
+            .remove(&dispute.tx)
             .ok_or(StateError::TransactionNotFound)?;
 
         // 2. this should never happen. Could unwrap, but this let's defensively return a recoverable error.
@@ -222,14 +289,10 @@ impl Store {
             .get_mut(&tx.client)
             .ok_or(StateError::AccountNotFound)?;
 
-        // 3. check if dispute transition is valid
-        tx.advance_dispute_state(&dispute)?;
+        let tx = account.apply_dispute(tx, &dispute)?;
+        self.transactions.insert(dispute.tx, tx);
 
-        match dispute.kind {
-            DisputeKind::Open => account._dispute(tx.amount),
-            DisputeKind::Resolve => account._resolve(tx.amount),
-            DisputeKind::ChargeBack => account._charge_back(tx.amount),
-        }
+        Ok(())
     }
 }
 
@@ -291,6 +354,57 @@ mod tests {
 
         let result = transaction.advance_dispute_state(&dispute);
         (result, transaction.dispute_state)
+    }
+
+    #[test]
+    fn account_operations_update_balances() {
+        let mut account = AccountState::default();
+        let assert_balances = |account: &AccountState, available, held, total| {
+            assert_eq!(
+                (account.available, account.held, account.total),
+                (available, held, total)
+            );
+        };
+
+        account._deposit(dec!(10.1234)).unwrap();
+        assert_balances(&account, dec!(10.1234), dec!(0), dec!(10.1234));
+
+        account._withdraw(dec!(2.1234)).unwrap();
+        assert_balances(&account, dec!(8), dec!(0), dec!(8));
+
+        account._dispute(dec!(3)).unwrap();
+        assert_balances(&account, dec!(5), dec!(3), dec!(8));
+
+        account._resolve(dec!(3)).unwrap();
+        assert_balances(&account, dec!(8), dec!(0), dec!(8));
+        assert!(!account.locked);
+
+        account._dispute(dec!(4)).unwrap();
+        assert_balances(&account, dec!(4), dec!(4), dec!(8));
+
+        account._charge_back(dec!(4)).unwrap();
+        assert_balances(&account, dec!(4), dec!(0), dec!(4));
+        assert!(account.locked);
+    }
+
+    #[test]
+    fn total_overflow_leaves_account_balances_unchanged() {
+        let available = Decimal::MAX - Decimal::ONE;
+        let mut account = AccountState {
+            available,
+            held: Decimal::ONE,
+            total: Decimal::MAX,
+            locked: false,
+        };
+
+        assert_eq!(
+            account._deposit(Decimal::ONE),
+            Err(StateError::ArithmeticOverflow)
+        );
+        assert_eq!(account.available, available);
+        assert_eq!(account.held, Decimal::ONE);
+        assert_eq!(account.total, Decimal::MAX);
+        assert!(!account.locked);
     }
 
     #[test]

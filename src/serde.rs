@@ -47,7 +47,8 @@ impl TryFrom<OperationRow> for Operation {
             OperationKind::Withdrawal => {
                 let amount = row
                     .amount
-                    .ok_or("Withdrawal transaction is missing amount.")?;
+                    .ok_or("Withdrawal transaction is missing amount.")?
+                    .trunc_with_scale(DECIMAL_PRECISION);
 
                 Ok(Self::Transaction(Transaction {
                     kind: TransactionKind::Withdrawal,
